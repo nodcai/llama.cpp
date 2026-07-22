@@ -350,6 +350,66 @@ MTMD_API int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk
 MTMD_API int32_t mtmd_batch_encode(mtmd_batch * batch);
 MTMD_API float * mtmd_batch_get_output_embd(mtmd_batch * batch, const mtmd_input_chunk * chunk);
 
+//
+// mtmd_audio_stream
+//
+// Incremental encoder for audio mmprojs. Push PCM in any chunk size; pull
+// soft-token embeddings as full encoder chunks (12 positions == 480 ms of
+// audio for gemma4a, equivalent to the model's chunk_size) become stable.
+// finalize() flushes the trailing partial chunk (right-padded with zeros).
+//
+// Currently only PROJECTOR_TYPE_GEMMA4A is supported. The encoder graph
+// itself is chunk-causal (chunk_size=12, max_past=12, context_right=0) so
+// emitted tokens are stable: pushing more PCM never invalidates tokens that
+// pull() has already returned. Mel is computed incrementally per push and
+// each chunk is encoded once via a per-chunk graph with carried K/V and
+// conv state, so per-pull cost is constant.
+//
+// Sample rate is the same as mtmd_get_audio_sample_rate(ctx). PCM must be
+// f32 mono at that rate. Per-token embedding dimension is the LLM's input
+// embedding size (audio soft tokens are injected as text-space embeddings).
+//
+// Typical use:
+//   mtmd_audio_stream * s = mtmd_audio_stream_init(ctx);
+//   while (more) {
+//       mtmd_audio_stream_push_pcm(s, samples, n);
+//       int n_new = 0;
+//       const float * embd = mtmd_audio_stream_pull(s, &n_new);
+//       if (n_new > 0) { /* feed n_new tokens of embd into llama_decode */ }
+//   }
+//   int n_tail = 0;
+//   const float * tail = mtmd_audio_stream_finalize(s, &n_tail);
+//   mtmd_audio_stream_free(s);
+typedef struct mtmd_audio_stream mtmd_audio_stream;
+
+// Initialize. Returns nullptr if `ctx` has no audio mmproj loaded or its
+// projector type does not support streaming.
+MTMD_API mtmd_audio_stream * mtmd_audio_stream_init(mtmd_context * ctx);
+MTMD_API void                mtmd_audio_stream_free(mtmd_audio_stream * stream);
+
+// Append PCM samples (16 kHz mono f32). May be called any number of times.
+MTMD_API void mtmd_audio_stream_push_pcm(mtmd_audio_stream * stream,
+                                         const float * samples,
+                                         size_t        n_samples);
+
+// Pull any newly-stable soft tokens. Writes the count to *n_new and returns
+// a pointer to an internal buffer of `(*n_new) * mtmd_audio_stream_n_embd()`
+// floats. The pointer is valid until the next pull/finalize/free. Returns
+// nullptr with *n_new=0 when no new full chunks are available.
+MTMD_API const float * mtmd_audio_stream_pull(mtmd_audio_stream * stream,
+                                              int *               n_new);
+
+// Flush the trailing partial chunk (right-padded with zeros). After this,
+// further push/pull return no new data. Same return contract as pull().
+MTMD_API const float * mtmd_audio_stream_finalize(mtmd_audio_stream * stream,
+                                                  int *               n_new);
+
+// Per-token embedding dimension for this stream's projector.
+MTMD_API int mtmd_audio_stream_n_embd(const mtmd_audio_stream * stream);
+
+// Total tokens emitted so far (cumulative across pulls and finalize).
+MTMD_API int mtmd_audio_stream_n_tokens_emitted(const mtmd_audio_stream * stream);
+
 
 // Set callback for all future logging events.
 // If this is not called, or NULL is supplied, everything is output on stderr.

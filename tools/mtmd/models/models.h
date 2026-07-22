@@ -176,6 +176,45 @@ struct clip_graph_gemma4a : clip_graph {
     clip_graph_gemma4a(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
     ggml_tensor * build_mm(ggml_tensor * w, ggml_tensor * x) const override;
+
+    // the graph is split into three reusable pieces so the streaming variant
+    // can share stem + head with the one-shot path:
+    //
+    //   stem: mel [n_mel, T_mel]  ->  encoder input [hidden, n_pos]
+    //         (two stride-2 Conv2D + LayerNorm + ReLU, flatten, input_proj)
+    //   body: encoder input [hidden, n_pos]  ->  encoded [hidden, n_pos]
+    //         (12 conformer layers: FFN1/2 half-step, chunked-local attention
+    //          with sinusoidal RPE + softcap, depthwise causal conv module)
+    //   head: encoded [hidden, n_pos]  ->  soft tokens [mm_dim, n_pos]
+    //         (output_proj + RMSNorm + soft_emb_norm + mm_input_proj)
+    //
+    // build() composes all three. n_head/d_head/hparams come from clip_graph.
+    ggml_tensor * build_stem(ggml_tensor * mel_in);
+    ggml_tensor * build_body(ggml_tensor * input);
+    ggml_tensor * build_head(ggml_tensor * encoded);
+
+    // streaming variant — one chunk of 12 encoder positions per call,
+    // with explicit past K/V (12 positions) and past conv state (4 positions)
+    // per layer wired in as graph inputs. New K/V/conv per layer are emitted
+    // as graph outputs the caller reads back into the persistent state.
+    //
+    // build_streaming() trims its mel input to the smallest slice that yields
+    // chunk K at the tail (12 stem positions covering mel frames
+    // 48K..48K+47 = 48 mel frames per chunk = 480 ms). The caller passes the
+    // appropriate cumulative-mel slice from the stateful streaming preprocessor.
+    //
+    // Per-layer input tensor names:  past_k_<il>, past_v_<il>, past_conv_<il>
+    // Per-layer output tensor names: new_k_<il>,  new_v_<il>,  new_conv_<il>
+    //
+    // build_streaming_body populates `stream_new_k`/_v/_conv with the per-
+    // layer state outputs so build_streaming can expand them into the
+    // forward graph (they are NOT on the dependency path from the head, so
+    // build_forward_expand wouldn't pick them up otherwise).
+    std::vector<ggml_tensor *> stream_new_k;
+    std::vector<ggml_tensor *> stream_new_v;
+    std::vector<ggml_tensor *> stream_new_conv;
+    ggml_tensor * build_streaming_body(ggml_tensor * input);
+    ggml_cgraph * build_streaming();
 };
 
 struct clip_graph_gemma4ua : clip_graph {

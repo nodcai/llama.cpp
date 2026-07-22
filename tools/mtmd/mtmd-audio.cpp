@@ -1420,6 +1420,177 @@ bool mtmd_audio_preprocessor_gemma4ua::preprocess(const float *                 
 }
 
 //
+// mtmd_audio_stream_preproc_gemma4a — stateful mel for streaming
+//
+
+mtmd_audio_stream_preproc_gemma4a::mtmd_audio_stream_preproc_gemma4a(const clip_ctx * ctx)
+    : hparams(*clip_get_hparams(ctx)) {
+    cache.fill_sin_cos_table(hparams.audio_n_fft);
+    cache.hann_window.assign(hparams.audio_n_fft, 0.0f);
+    for (uint32_t i = 0; i < (uint32_t) hparams.audio_window_len; i++) {
+        cache.hann_window[i] = 0.5f - 0.5f * cosf((2.0f * (float) M_PI * i) / hparams.audio_window_len);
+    }
+    cache.fill_mel_filterbank_matrix(
+        hparams.n_mel_bins, hparams.audio_n_fft, hparams.audio_sample_rate,
+        0.0f, hparams.audio_sample_rate / 2.0f,
+        /*slaney_area_norm=*/ false,
+        /*scale=*/ 1.0f,
+        /*use_htk=*/ true);
+}
+
+void mtmd_audio_stream_preproc_gemma4a::reset() {
+    initialized = false;
+    pcm.clear();
+    mel_time_major.clear();
+    n_emitted = 0;
+}
+
+size_t mtmd_audio_stream_preproc_gemma4a::n_pcm_samples() const {
+    if (!initialized) return 0;
+    const size_t pad_left = (size_t) hparams.audio_window_len / 2;
+    return pcm.size() > pad_left ? pcm.size() - pad_left : 0;
+}
+
+static filter_params gemma4a_stream_filter_params(const clip_hparams & hparams) {
+    filter_params p;
+    p.n_mel            = hparams.n_mel_bins;
+    p.n_fft_bins       = 1 + (hparams.audio_n_fft / 2);
+    p.hann_window_size = hparams.audio_n_fft;     // window is zero-padded to FFT size
+    p.hop_length       = hparams.audio_hop_len;
+    p.sample_rate      = hparams.audio_sample_rate;
+    p.no_padding       = true;
+    p.center_padding   = false;
+    p.preemph          = 0.0f;
+    p.use_natural_log  = true;
+    p.use_magnitude    = true;
+    p.mel_floor        = 0.001f;
+    p.norm_per_feature = false;
+    return p;
+}
+
+void mtmd_audio_stream_preproc_gemma4a::push(const float * samples, size_t n_samples) {
+    if (n_samples == 0) return;
+
+    const int frame_size = hparams.audio_n_fft;       // 512
+    const int hop        = hparams.audio_hop_len;     // 160
+    const int n_mel      = hparams.n_mel_bins;        // 128
+    const int pad_left   = hparams.audio_window_len / 2; // 160
+
+    if (!initialized) {
+        pcm.assign((size_t) pad_left, 0.0f);
+        initialized = true;
+    }
+    pcm.insert(pcm.end(), samples, samples + n_samples);
+
+    // Optional but useful guard: assert single-mel-chunk regime. The one-shot
+    // gemma4a preprocessor splits at 30 s; if we ever cross that, the
+    // streaming preprocessor needs to start a fresh mel chunk (with its own
+    // pad_left zeros) and the encoder would need a separate pass. For now we
+    // assume conversational utterances stay below 30 s.
+    GGML_ASSERT(n_pcm_samples() <= (size_t) (30 * hparams.audio_sample_rate)
+                && "mtmd_audio_stream_preproc_gemma4a: >30 s streams not yet supported");
+
+    // Compute new mel frames from the slice past the last emitted frame.
+    // Frame m's window covers pcm[m*hop, m*hop + frame_size). For the next
+    // frame (m = n_emitted) to fit without right-pad, we need
+    //   pcm.size() >= n_emitted * hop + frame_size.
+    const size_t slice_start = (size_t) n_emitted * (size_t) hop;
+    if (pcm.size() < slice_start + (size_t) frame_size) {
+        return;
+    }
+    const size_t slice_size = pcm.size() - slice_start;
+    const int    new_frames = (int) ((slice_size - frame_size) / hop) + 1;
+    if (new_frames <= 0) return;
+
+    filter_params params = gemma4a_stream_filter_params(hparams);
+
+    mtmd_audio_mel mel_tmp;
+    if (!log_mel_spectrogram(pcm.data() + slice_start, (int) slice_size, /*n_threads=*/ 1,
+                             params, cache, mel_tmp)) {
+        // log_mel_spectrogram emits a structured error itself; bail with no-op.
+        return;
+    }
+    // log_mel_spectrogram computes out.n_len = (n_samples - frame_size)/hop + 1
+    // for no_padding=true. Verify match.
+    GGML_ASSERT(mel_tmp.n_len == new_frames);
+    GGML_ASSERT(mel_tmp.n_mel == n_mel);
+
+    // Append to time-major store.
+    const size_t old = mel_time_major.size();
+    mel_time_major.resize(old + (size_t) new_frames * (size_t) n_mel);
+    for (int t = 0; t < new_frames; t++) {
+        for (int m = 0; m < n_mel; m++) {
+            mel_time_major[old + (size_t) t * (size_t) n_mel + (size_t) m] =
+                mel_tmp.data[(size_t) m * (size_t) new_frames + (size_t) t];
+        }
+    }
+    n_emitted += new_frames;
+}
+
+void mtmd_audio_stream_preproc_gemma4a::get_mel(mtmd_audio_mel & out, bool with_right_pad) {
+    const int frame_size = hparams.audio_n_fft;
+    const int hop        = hparams.audio_hop_len;
+    const int n_mel      = hparams.n_mel_bins;
+    const int pad_left   = hparams.audio_window_len / 2;
+
+    // Optionally emit the trailing frame that the one-shot preprocessor would
+    // compute (with right-pad zeros). pt_frames matches the gemma4a path's
+    // formula in mtmd-audio.cpp: pt = (n_real + pad_left - (window_len+1))/hop + 1.
+    if (with_right_pad && initialized) {
+        const int n_real = (int) n_pcm_samples();
+        const int pt_frames =
+            std::max(0, (n_real + pad_left - (hparams.audio_window_len + 1)) / hop + 1);
+
+        if (pt_frames > n_emitted) {
+            const int n_padded_needed = (pt_frames - 1) * hop + frame_size;
+            const int total_pad = std::max(n_padded_needed - n_real, pad_left);
+            const int right_pad = total_pad - pad_left;
+
+            std::vector<float> padded = pcm;
+            padded.resize(padded.size() + (size_t) right_pad, 0.0f);
+
+            const size_t slice_start = (size_t) n_emitted * (size_t) hop;
+            if (padded.size() >= slice_start + (size_t) frame_size) {
+                const size_t slice_size = padded.size() - slice_start;
+                const int    extra_frames = (int) ((slice_size - frame_size) / hop) + 1;
+
+                filter_params params = gemma4a_stream_filter_params(hparams);
+                mtmd_audio_mel mel_tmp;
+                if (log_mel_spectrogram(padded.data() + slice_start, (int) slice_size, 1,
+                                        params, cache, mel_tmp)) {
+                    // Keep at most (pt_frames - n_emitted) of these (matches
+                    // the one-shot path's `out.n_len = min(n_len, pt_frames)`
+                    // trim).
+                    const int n_take = std::min(extra_frames, pt_frames - n_emitted);
+                    const size_t old = mel_time_major.size();
+                    mel_time_major.resize(old + (size_t) n_take * (size_t) n_mel);
+                    for (int t = 0; t < n_take; t++) {
+                        for (int m = 0; m < n_mel; m++) {
+                            mel_time_major[old + (size_t) t * (size_t) n_mel + (size_t) m] =
+                                mel_tmp.data[(size_t) m * (size_t) extra_frames + (size_t) t];
+                        }
+                    }
+                    n_emitted += n_take;
+                }
+            }
+        }
+    }
+
+    // Transpose time-major → mel-major for the encoder.
+    out.n_mel     = n_mel;
+    out.n_len     = n_emitted;
+    out.n_len_org = n_emitted;
+    out.data.resize((size_t) n_mel * (size_t) n_emitted);
+    for (int t = 0; t < n_emitted; t++) {
+        for (int m = 0; m < n_mel; m++) {
+            out.data[(size_t) m * (size_t) n_emitted + (size_t) t] =
+                mel_time_major[(size_t) t * (size_t) n_mel + (size_t) m];
+        }
+    }
+}
+
+
+//
 // mtmd_audio_streaming_istft implementation
 //
 

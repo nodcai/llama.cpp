@@ -121,6 +121,39 @@ struct clip_encode_params {
     std::vector<uint8_t> *       state_out = nullptr; // state for the next call
 };
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params);
+// Streaming-audio encode for PROJECTOR_TYPE_GEMMA4A.
+// Encodes a single 12-position chunk: the caller passes a mel slice with the
+// chunk-to-emit at the tail (12 stem positions = 48 mel frames) and per-layer
+// past K/V/conv state from the previous chunk. The function fills `out_chunk`
+// with 12 * clip_n_mmproj_embd(ctx) floats and updates state in-place.
+//
+// State buffer layout per layer L (n_layers = clip.audio.block_count):
+//   past_k[L], new_k[L]:    n_head * d_head * 12 floats
+//   past_v[L], new_v[L]:    n_head * d_head * 12 floats
+//   past_conv[L], new_conv[L]: conv_inner * 4 floats
+// On the first chunk, callers initialise past_* to zeros. After return, the
+// new_* buffers must be copied into past_* before the next chunk.
+struct clip_audio_stream_state {
+    std::vector<std::vector<float>> past_k;
+    std::vector<std::vector<float>> past_v;
+    std::vector<std::vector<float>> past_conv;
+    std::vector<std::vector<float>> new_k;
+    std::vector<std::vector<float>> new_v;
+    std::vector<std::vector<float>> new_conv;
+};
+
+// chunk_idx: 0-based index of this chunk in the stream. Used to choose the
+// attention mask — chunk 0 must hide its 12 past-K/V positions (the past
+// buffers are real zeros, not "missing data"), all later chunks use the
+// standard chunked-local steady-state mask.
+bool clip_audio_stream_encode_chunk(struct clip_ctx * ctx,
+                                    int n_threads,
+                                    const struct clip_image_f32 * mel,
+                                    int chunk_idx,
+                                    struct clip_audio_stream_state & state,
+                                    float * out_chunk);
+
+void clip_audio_stream_state_init(struct clip_ctx * ctx, struct clip_audio_stream_state & state);
 
 bool clip_is_llava(const struct clip_ctx * ctx);
 // note for contributor: this clip_is_(model) pattern is deprecated

@@ -5975,6 +5975,203 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     return true;
 }
 
+// ----- streaming-audio chunk encode (GEMMA4A only) -----
+
+static int gemma4a_conv_inner_dim(const clip_ctx * ctx) {
+    GGML_ASSERT(ctx->model.layers.size() > 0);
+    const auto & layer0 = ctx->model.layers[0];
+    GGML_ASSERT(layer0.conv_pw1_w != nullptr);
+    return (int) (layer0.conv_pw1_w->ne[1] / 2);  // pw1 outputs 2*conv_inner for GLU
+}
+
+void clip_audio_stream_state_init(struct clip_ctx * ctx, struct clip_audio_stream_state & state) {
+    GGML_ASSERT(ctx->model.proj_type == PROJECTOR_TYPE_GEMMA4A);
+    const int n_layer    = ctx->model.hparams.n_layer;
+    const int n_embd     = ctx->model.hparams.n_embd;      // d_head * n_head
+    const int conv_inner = gemma4a_conv_inner_dim(ctx);
+    const int P          = 12;  // max_past = chunk_size for gemma4a
+    const int P_conv     = 4;   // depthwise conv kernel - 1
+
+    auto resize_zeros = [&](std::vector<std::vector<float>> & vv, int per_layer_floats) {
+        vv.assign(n_layer, std::vector<float>((size_t) per_layer_floats, 0.0f));
+    };
+    resize_zeros(state.past_k,    n_embd * P);
+    resize_zeros(state.past_v,    n_embd * P);
+    resize_zeros(state.past_conv, conv_inner * P_conv);
+    resize_zeros(state.new_k,     n_embd * P);
+    resize_zeros(state.new_v,     n_embd * P);
+    resize_zeros(state.new_conv,  conv_inner * P_conv);
+}
+
+bool clip_audio_stream_encode_chunk(struct clip_ctx * ctx,
+                                    int n_threads,
+                                    const struct clip_image_f32 * mel,
+                                    int chunk_idx,
+                                    struct clip_audio_stream_state & state,
+                                    float * out_chunk) {
+    GGML_ASSERT(ctx->model.proj_type == PROJECTOR_TYPE_GEMMA4A);
+    GGML_ASSERT(mel != nullptr);
+    GGML_ASSERT(chunk_idx >= 0);
+
+    // Mirror clip_image_batch_encode's per-call setup. The streaming graph
+    // has additional state inputs/outputs but reuses the same backend sched.
+    clip_image_f32_batch imgs;
+    imgs.is_audio = true;
+    {
+        // Copy the mel into the batch. clip_image_f32's buf is private now,
+        // so we go through set_size + cpy_buf. get_ro_buf() lets us read the
+        // caller's mel buffer without touching the private field directly.
+        clip_image_f32 mel_copy;
+        mel_copy.set_size({mel->nx(), mel->ny()}, /*is_placeholder=*/ false, /*is_audio=*/ true);
+        mel_copy.cpy_buf(mel->get_ro_buf());
+        imgs.entries.push_back(std::move(mel_copy));
+    }
+
+    if (!ctx->is_allocated) {
+        clip_model_loader::warmup(*ctx, imgs);
+    }
+
+    ggml_backend_sched_reset(ctx->sched.get());
+
+    // Build the streaming graph directly (separate from clip_image_build_graph).
+    ggml_cgraph * gf = nullptr;
+    {
+        // Mirror the lambda chunk of clip_image_build_graph but for streaming.
+        const clip_image_f32 & img = imgs.entries[0];
+        auto builder = std::make_unique<clip_graph_gemma4a>(ctx, img);
+        gf = builder->build_streaming();
+    }
+    if (!gf) {
+        LOG_ERR("%s: streaming graph build failed\n", __func__);
+        return false;
+    }
+    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+
+    // Lambdas to access named graph inputs/outputs.
+    auto get_inp_tensor = [&gf](const char * name) {
+        ggml_tensor * t = ggml_graph_get_tensor(gf, name);
+        GGML_ASSERT(t != nullptr);
+        GGML_ASSERT(t->flags & GGML_TENSOR_FLAG_INPUT);
+        return t;
+    };
+    auto set_input_f32 = [&get_inp_tensor](const char * name, const float * data, size_t nelem) {
+        ggml_tensor * t = get_inp_tensor(name);
+        GGML_ASSERT(t->type == GGML_TYPE_F32);
+        GGML_ASSERT((size_t) ggml_nelements(t) == nelem);
+        ggml_backend_tensor_set(t, data, 0, ggml_nbytes(t));
+    };
+
+    // mel input
+    {
+        const int n_step = mel->nx();
+        const int n_mel  = mel->ny();
+        const auto & mel_buf = mel->get_ro_buf();
+        std::vector<float> inp_raw((size_t) n_step * (size_t) n_mel);
+        std::memcpy(inp_raw.data(), mel_buf.data(), inp_raw.size() * sizeof(float));
+        set_input_f32("inp_raw", inp_raw.data(), inp_raw.size());
+    }
+
+    // gemma4a pos_emb + kq_mask (single-block, B=1). Replicates the relevant
+    // branch of clip_image_batch_encode's per-projector setup with num_blocks
+    // forced to 1.
+    const int C        = 12;
+    const int P        = 12;
+    const int S        = C + P;
+    const int R        = P + 1;
+    const int max_past = 12;
+    {
+        // Mirror the one-shot mask construction at the streaming block. With
+        // gq = chunk_idx*C + q and gk = chunk_idx*C - max_past + k:
+        //   mask = 0 iff  gk >= 0 AND gk <= gq AND (gq - gk) < max_past
+        //   else -inf
+        // For chunk_idx >= 1 the gk >= 0 check is vacuous (it filters the
+        // first 12 positions = past chunk's K/V); for chunk_idx == 0 it kills
+        // the 12 zero-initialised past entries so they don't pollute the
+        // softmax denominator.
+        std::vector<float> mask((size_t) S * (size_t) C * 1, -INFINITY);
+        for (int q = 0; q < C; q++) {
+            const int gq = chunk_idx * C + q;
+            for (int k = 0; k < S; k++) {
+                const int gk = chunk_idx * C - max_past + k;
+                if (gk >= 0 && gk <= gq && (gq - gk) < max_past) {
+                    mask[(size_t) k + (size_t) q * S] = 0.0f;
+                }
+            }
+        }
+        set_input_f32("kq_mask", mask.data(), mask.size());
+    }
+    {
+        // Sinusoidal RPE: 13 positions [12, 11, ..., 0]. Same as gemma4a one-shot.
+        const int n_embd = ctx->model.hparams.n_embd;
+        const int num_timescales = n_embd / 2;
+        const float log_ts = logf(10000.0f) / std::max(num_timescales - 1, 1);
+        std::vector<float> pos_emb((size_t) n_embd * (size_t) R, 0.0f);
+        for (int p = 0; p < R; p++) {
+            float position = (float)(P - p);
+            for (int i = 0; i < num_timescales; i++) {
+                float scaled = position * expf(-(float) i * log_ts);
+                pos_emb[(size_t) p * n_embd + i]                    = sinf(scaled);
+                pos_emb[(size_t) p * n_embd + i + num_timescales]   = cosf(scaled);
+            }
+        }
+        set_input_f32("pos_emb", pos_emb.data(), pos_emb.size());
+    }
+
+    // Per-layer past K/V/conv state inputs.
+    const int n_layer = ctx->model.hparams.n_layer;
+    char nm[64];
+    for (int il = 0; il < n_layer; il++) {
+        snprintf(nm, sizeof nm, "past_k_%d", il);
+        set_input_f32(nm, state.past_k[il].data(), state.past_k[il].size());
+        snprintf(nm, sizeof nm, "past_v_%d", il);
+        set_input_f32(nm, state.past_v[il].data(), state.past_v[il].size());
+        snprintf(nm, sizeof nm, "past_conv_%d", il);
+        set_input_f32(nm, state.past_conv[il].data(), state.past_conv[il].size());
+    }
+
+    // n_threads: copied from clip_image_batch_encode.
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend_cpu);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg) {
+        auto set_n_threads_fn = (ggml_backend_set_n_threads_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (set_n_threads_fn) set_n_threads_fn(ctx->backend_cpu, n_threads);
+    }
+
+    auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LOG_ERR("%s: graph_compute failed (%d)\n", __func__, status);
+        return false;
+    }
+
+    // Read the soft-token chunk output (last node, shape [mm_embd, 12]).
+    ggml_tensor * out = ggml_graph_node(gf, -1);
+    if (out_chunk != nullptr) {
+        ggml_backend_tensor_get(out, out_chunk, 0, ggml_nbytes(out));
+    }
+
+    // Read back new state into the caller's buffers.
+    for (int il = 0; il < n_layer; il++) {
+        snprintf(nm, sizeof nm, "new_k_%d", il);
+        ggml_tensor * t = ggml_graph_get_tensor(gf, nm);
+        GGML_ASSERT(t != nullptr);
+        GGML_ASSERT((size_t) ggml_nelements(t) == state.new_k[il].size());
+        ggml_backend_tensor_get(t, state.new_k[il].data(), 0, ggml_nbytes(t));
+
+        snprintf(nm, sizeof nm, "new_v_%d", il);
+        t = ggml_graph_get_tensor(gf, nm);
+        GGML_ASSERT(t != nullptr);
+        ggml_backend_tensor_get(t, state.new_v[il].data(), 0, ggml_nbytes(t));
+
+        snprintf(nm, sizeof nm, "new_conv_%d", il);
+        t = ggml_graph_get_tensor(gf, nm);
+        GGML_ASSERT(t != nullptr);
+        ggml_backend_tensor_get(t, state.new_conv[il].data(), 0, ggml_nbytes(t));
+    }
+
+    return true;
+}
+
 int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
     switch (ctx->model.proj_type) {
         case PROJECTOR_TYPE_LDP:

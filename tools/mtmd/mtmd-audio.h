@@ -104,6 +104,39 @@ struct mtmd_audio_preprocessor_gemma4ua : mtmd_audio_preprocessor {
     bool preprocess(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output) const override;
 };
 
+// Stateful streaming mel preprocessor for gemma4a (mtmd_audio_stream backend).
+// Holds the cumulative PCM with the semicausal left-pad applied once at start,
+// and emits new mel frames in O(new_pcm_samples) per push by feeding only the
+// unseen slice to log_mel_spectrogram. Frame values are bit-identical to the
+// one-shot gemma4a preprocessor: the Hann window + FFT + mel filterbank for a
+// frame at offset O depend only on samples [O, O+frame_size), so slicing the
+// buffer at a hop boundary doesn't change the math. The trailing "tentative"
+// frame (whose mel window would extend past the cumulative PCM) is held back
+// until finalize(), which pads with zeros to match the one-shot path's
+// right-pad semantics exactly. Assumes audio < 30 s (one mel chunk).
+struct mtmd_audio_stream_preproc_gemma4a {
+    explicit mtmd_audio_stream_preproc_gemma4a(const clip_ctx * ctx);
+
+    void   push(const float * samples, size_t n_samples);
+    // Build the encoder-ready mel buffer (mel-major [n_mel][n_emitted()]).
+    // When `with_right_pad` is true, also emits the trailing one frame that
+    // matches the one-shot preprocessor's pt_frames count using zero right-pad
+    // — call this only at finalize().
+    void   get_mel(mtmd_audio_mel & out, bool with_right_pad);
+    int    n_emitted_frames() const { return n_emitted; }
+    size_t n_pcm_samples() const;   // cumulative real PCM seen (excluding pad)
+    void   reset();
+
+  private:
+    const clip_hparams & hparams;
+    mtmd_audio_cache     cache;
+
+    bool               initialized = false;
+    std::vector<float> pcm;       // [pad_left zeros] + cumulative real PCM
+    std::vector<float> mel_time_major; // [n_emitted * n_mel] time-major
+    int                n_emitted = 0;
+};
+
 struct mtmd_audio_preprocessor_qwen3a : mtmd_audio_preprocessor {
     mtmd_audio_preprocessor_qwen3a(const clip_ctx * ctx) : mtmd_audio_preprocessor(ctx) {}
     void initialize() override;

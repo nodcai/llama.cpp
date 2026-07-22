@@ -2175,6 +2175,247 @@ float * mtmd_batch_get_output_embd(mtmd_batch * batch, const mtmd_input_chunk * 
     return nullptr; // not found
 }
 
+//
+// mtmd_audio_stream
+//
+// gemma4a chunk_size is 12 encoder positions == 48 mel frames == 480 ms of
+// audio. Emitted tokens are stable because the encoder's chunked attention
+// has context_right=0 (no future lookahead) — a token in chunk K only ever
+// depends on positions <= 12K+11, so once a complete chunk has been
+// produced, pushing more PCM cannot change its values.
+//
+
+struct mtmd_audio_stream {
+    mtmd_context * ctx = nullptr;
+    int n_embd        = 0;
+    int n_emitted     = 0;   // total tokens caller has been told about
+    bool finalized    = false;
+
+    // stateful mel preprocessor. Holds pcm + mel state across pulls so
+    // we don't recompute mel from scratch each push.
+    std::unique_ptr<mtmd_audio_stream_preproc_gemma4a> preproc;
+
+    // per-stream encoder state + cache of already-streamed chunks
+    clip_audio_stream_state enc_state;
+    bool                    enc_state_initialized = false;
+    int                     n_chunks_streamed     = 0;   // chunks encoded via streaming path
+    std::vector<float>      streamed_tokens;             // n_chunks_streamed * 12 * n_embd floats
+
+    std::vector<float> pull_buf;     // output buffer returned to caller (owns latest pull's data)
+};
+
+// Encode any newly-encodable steady-state chunks via the streaming
+// path (constant per-chunk cost), then for finalize fall back to one-shot
+// on the full cumulative mel to pick up the trailing partial chunk's
+// positions (which the streaming graph can't cover bit-exactly because the
+// chunked-attention mask for an incomplete last block differs).
+//
+// On return, `out` holds the cumulative token buffer for the stream so far:
+//   out[0 .. n_chunks_streamed*12)        = streaming-encoded soft tokens
+//   out[n_chunks_streamed*12 .. n_tot)    = one-shot tail (finalize only)
+// Pull bookkeeping in mtmd_audio_stream_pull_impl emits the slice past
+// s->n_emitted.
+static bool mtmd_audio_stream_encode_all(mtmd_audio_stream * s, std::vector<float> & out, bool with_right_pad) {
+    out.clear();
+    if (!s->preproc || s->preproc->n_pcm_samples() == 0) {
+        return true;
+    }
+
+    if (!s->enc_state_initialized) {
+        clip_audio_stream_state_init(s->ctx->ctx_a, s->enc_state);
+        s->enc_state_initialized = true;
+    }
+
+    mtmd_audio_mel mel;
+    s->preproc->get_mel(mel, with_right_pad);
+    if (mel.n_len == 0) {
+        return true;
+    }
+
+    // Each streaming chunk consumes exactly 48 mel frames (= 12 stem
+    // positions). Steady-state chunk K is encodable when the cumulative
+    // (stable) mel has at least (K+1)*48 frames.
+    const int chunk_mel = 48;
+    const int max_chunks_encodable = mel.n_len / chunk_mel;
+
+    char nm[64]; (void) nm;
+    for (int K = s->n_chunks_streamed; K < max_chunks_encodable; K++) {
+        const int slice_len = (K + 1) * chunk_mel;
+
+        // Build a mel slice [n_mel][slice_len] by trimming the cumulative
+        // mel (mel-major). The streaming graph runs stem on this slice and
+        // takes the last 12 stem positions as chunk K's input.
+        clip_image_f32 slice;
+        slice.set_size(clip_image_size{(int) slice_len, (int) mel.n_mel},
+                       /*is_placeholder=*/ false, /*is_audio=*/ true);
+        {
+            // set_size allocates buf but we need to populate it. There's no
+            // rw accessor for buf, so build a std::vector and cpy_buf.
+            std::vector<float> tmp((size_t) mel.n_mel * (size_t) slice_len);
+            for (int m = 0; m < mel.n_mel; m++) {
+                std::memcpy(tmp.data()      + (size_t) m * slice_len,
+                            mel.data.data() + (size_t) m * mel.n_len,
+                            (size_t) slice_len * sizeof(float));
+            }
+            slice.cpy_buf(tmp);
+        }
+
+        std::vector<float> chunk_out((size_t) 12 * (size_t) s->n_embd);
+        if (!clip_audio_stream_encode_chunk(s->ctx->ctx_a, s->ctx->n_threads,
+                                            &slice, K, s->enc_state,
+                                            chunk_out.data())) {
+            LOG_ERR("%s: streaming chunk %d encode failed\n", __func__, K);
+            return false;
+        }
+        s->streamed_tokens.insert(s->streamed_tokens.end(),
+                                  chunk_out.begin(), chunk_out.end());
+
+        // Rotate new_* into past_* for the next chunk. The new_* buffers
+        // were filled in place by encode_chunk; swap is O(1).
+        std::swap(s->enc_state.past_k,    s->enc_state.new_k);
+        std::swap(s->enc_state.past_v,    s->enc_state.new_v);
+        std::swap(s->enc_state.past_conv, s->enc_state.new_conv);
+
+        s->n_chunks_streamed = K + 1;
+    }
+
+    out = s->streamed_tokens;
+
+    if (!with_right_pad) {
+        // Pull: only emit fully-streamed chunks. The trailing partial (if
+        // any) waits for finalize.
+        return true;
+    }
+
+    // Finalize: run one-shot on the full cumulative mel to recover the
+    // trailing partial-chunk positions (positions past n_chunks_streamed*12).
+    // The streaming graph can't emit those bit-exact because the chunked-
+    // attention mask for an incomplete last block differs from the
+    // steady-state mask.
+    clip_image_f32 mel_full;
+    mel_full.set_size(clip_image_size{(int) mel.n_len, (int) mel.n_mel},
+                      /*is_placeholder=*/ false, /*is_audio=*/ true);
+    mel_full.cpy_buf(mel.data);
+
+    const int n_tokens_total = clip_n_output_tokens(s->ctx->ctx_a, &mel_full);
+    const int n_streamed     = s->n_chunks_streamed * 12;
+    if (n_tokens_total <= n_streamed) {
+        return true;
+    }
+
+    clip_image_f32_batch batch;
+    batch.is_audio = true;
+    batch.entries.push_back(std::move(mel_full));
+
+    std::vector<float> oneshot;  // sized by clip_image_batch_encode
+    if (!clip_image_batch_encode(s->ctx->ctx_a, s->ctx->n_threads, &batch, oneshot)) {
+        LOG_ERR("%s: one-shot finalize encode failed (n_tokens=%d)\n",
+                __func__, n_tokens_total);
+        return false;
+    }
+
+    out.insert(out.end(),
+               oneshot.begin() + (size_t) n_streamed * s->n_embd,
+               oneshot.end());
+    return true;
+}
+
+// Re-encode the cumulative buffer and return the slice past `n_emitted`.
+// `chunk_truncate`: if true, round the returned count down to a multiple of
+// the encoder chunk size so the caller never sees soft tokens that sit in a
+// trailing partial chunk (which would change values when more PCM arrives).
+// Finalize passes chunk_truncate=false to flush the tail with zero right-pad.
+static const float * mtmd_audio_stream_pull_impl(mtmd_audio_stream * s, int * n_new, bool chunk_truncate) {
+    if (n_new) *n_new = 0;
+    if (!s || s->finalized) {
+        return nullptr;
+    }
+
+    std::vector<float> all_embd;
+    // Pulls run on stable mel only (no right-pad); finalize requests the
+    // trailing tentative frame so the encoder sees exactly what the one-shot
+    // preprocessor would emit at end-of-stream.
+    const bool with_right_pad = !chunk_truncate;
+    if (!mtmd_audio_stream_encode_all(s, all_embd, with_right_pad)) {
+        return nullptr;
+    }
+
+    const size_t total_floats = all_embd.size();
+    const int    total_tokens = (int) (total_floats / (size_t) s->n_embd);
+
+    int stable_tokens = total_tokens;
+    if (chunk_truncate) {
+        // Only chunks that have actually been encoded via the streaming
+        // path are stable. The stateful preprocessor only releases mel
+        // frames whose PCM window is fully real, so an encodable chunk K is
+        // by definition bit-exact stable: pushing more PCM will not change
+        // any of its mel inputs and therefore not any of its encoder outputs.
+        stable_tokens = s->n_chunks_streamed * 12;
+    }
+
+    if (stable_tokens <= s->n_emitted) {
+        return nullptr;
+    }
+
+    const int n_to_emit = stable_tokens - s->n_emitted;
+    s->pull_buf.assign(
+        all_embd.begin() + (size_t) s->n_emitted * (size_t) s->n_embd,
+        all_embd.begin() + (size_t) stable_tokens * (size_t) s->n_embd);
+    s->n_emitted = stable_tokens;
+
+    if (n_new) *n_new = n_to_emit;
+    return s->pull_buf.data();
+}
+
+mtmd_audio_stream * mtmd_audio_stream_init(mtmd_context * ctx) {
+    if (!ctx || !ctx->ctx_a) {
+        LOG_ERR("%s: context has no audio mmproj\n", __func__);
+        return nullptr;
+    }
+    if (ctx->proj_type_a() != PROJECTOR_TYPE_GEMMA4A) {
+        LOG_ERR("%s: streaming only supported for PROJECTOR_TYPE_GEMMA4A\n", __func__);
+        return nullptr;
+    }
+    auto * s = new mtmd_audio_stream;
+    s->ctx     = ctx;
+    s->n_embd  = ctx->n_embd_text;
+    s->preproc = std::make_unique<mtmd_audio_stream_preproc_gemma4a>(ctx->ctx_a);
+    return s;
+}
+
+void mtmd_audio_stream_free(mtmd_audio_stream * s) {
+    delete s;
+}
+
+void mtmd_audio_stream_push_pcm(mtmd_audio_stream * s, const float * samples, size_t n_samples) {
+    if (!s || s->finalized || !samples || n_samples == 0) {
+        return;
+    }
+    s->preproc->push(samples, n_samples);
+}
+
+const float * mtmd_audio_stream_pull(mtmd_audio_stream * s, int * n_new) {
+    return mtmd_audio_stream_pull_impl(s, n_new, /*chunk_truncate=*/ true);
+}
+
+const float * mtmd_audio_stream_finalize(mtmd_audio_stream * s, int * n_new) {
+    if (!s || s->finalized) {
+        if (n_new) *n_new = 0;
+        return nullptr;
+    }
+    const float * ret = mtmd_audio_stream_pull_impl(s, n_new, /*chunk_truncate=*/ false);
+    s->finalized = true;
+    return ret;
+}
+
+int mtmd_audio_stream_n_embd(const mtmd_audio_stream * s) {
+    return s ? s->n_embd : 0;
+}
+
+int mtmd_audio_stream_n_tokens_emitted(const mtmd_audio_stream * s) {
+    return s ? s->n_emitted : 0;
+}
+
 bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk) {
     auto proj_type = ctx->proj_type_v();
     if (chunk && chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
