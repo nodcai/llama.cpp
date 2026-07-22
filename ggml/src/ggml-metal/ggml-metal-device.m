@@ -1271,6 +1271,14 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 // In case of eGPU, shared memory may be preferable.
                 dev->props.use_shared_buffers |= [dev->mtl_device location] == MTLDeviceLocationExternal;
 #endif
+#if !TARGET_OS_OSX
+                // iOS: newBufferWithBytesNoCopy fails against posix_memalign'd
+                // memory for large allocations (e.g. multi-hundred-MB mmproj
+                // weights), and vm_allocate isn't wired for iOS in host_malloc,
+                // so shared mode reliably crashes at load. Private mode works
+                // and, on unified memory, has no perceptible perf cost.
+                dev->props.use_shared_buffers = false;
+#endif
                 if (getenv("GGML_METAL_SHARED_BUFFERS_DISABLE") != NULL) {
                     dev->props.use_shared_buffers = false;
                 }
