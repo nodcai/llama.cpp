@@ -4008,7 +4008,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             ctx_params.progress_callback_user_data);
         bool skip_audio = false;
 
-        if (loader.has_vision) {
+        if (loader.has_vision && ctx_params.load_vision) {
             ctx_vision = new clip_ctx(ctx_params);
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
             loader.load_tensors(*ctx_vision);
@@ -4022,7 +4022,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             skip_audio = ctx_vision->model.proj_type == PROJECTOR_TYPE_GEMMA3NV;
         }
 
-        if (loader.has_audio && !skip_audio) {
+        if (loader.has_audio && !skip_audio && ctx_params.load_audio) {
             ctx_audio = new clip_ctx(ctx_params);
             loader.load_hparams(ctx_audio->model, CLIP_MODALITY_AUDIO);
             loader.load_tensors(*ctx_audio);

@@ -49,6 +49,12 @@ enum clip_flash_attn_type {
 struct clip_context_params {
     bool use_gpu;
     ggml_backend_dev_t device;
+    // Skip a modality the caller will never use. An mmproj carrying both
+    // towers otherwise loads and warms up both, and reserves a compute buffer
+    // for each, even when only one is ever fed. Default true = load whatever
+    // the file declares.
+    bool load_vision;
+    bool load_audio;
     enum clip_flash_attn_type flash_attn_type;
     int image_min_tokens;
     int image_max_tokens;

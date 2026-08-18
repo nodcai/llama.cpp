@@ -97,6 +97,16 @@ typedef bool (*mtmd_progress_callback)(float progress, void * user_data);
 struct mtmd_context_params {
     bool use_gpu;
     ggml_backend_dev_t device;
+    // Load only the modality you will actually use. An mmproj that carries
+    // both towers loads both by default, warms both up, and reserves a
+    // compute buffer for each — for gemma-4 that is ~215 MiB of vision
+    // weights plus a ~101 MiB Metal buffer sitting idle in an audio-only
+    // application. Both default to true.
+    //
+    // Note: on Gemma 3N the audio tower is not supported and is skipped
+    // whenever vision loads; disabling vision there would try to load it.
+    bool load_vision;
+    bool load_audio;
     bool print_timings;
     int n_threads;
     const char * image_marker; // deprecated, use media_marker instead
