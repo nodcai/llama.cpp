@@ -533,6 +533,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     int device;
     int physical_device;
     CUdeviceptr pool_addr = 0;
+    size_t pool_va_size = 0;   // address range actually reserved
     size_t pool_used = 0;
     size_t pool_size = 0;
     size_t granularity;
@@ -556,7 +557,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #else
             CU_CHECK(cuMemUnmap(pool_addr, pool_size));
 #endif
-            CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
+            CU_CHECK(cuMemAddressFree(pool_addr, pool_va_size));
         }
     }
 
@@ -572,7 +573,32 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             size_t reserve_size = size - avail;
             reserve_size = granularity * ((reserve_size + granularity - 1) / granularity);
 
-            GGML_ASSERT(pool_size + reserve_size <= CUDA_POOL_VMM_MAX_SIZE);
+            // Reserve virtual address space (if not already reserved). Start at
+            // the nominal maximum and halve on failure rather than aborting:
+            // on integrated GPUs (e.g. Tegra) the "VRAM" is shared system memory,
+            // so a 32 GB reservation is refused once the model is resident. A
+            // smaller pool still works there, while discrete GPUs, where the
+            // reservation is cheap, keep the full range.
+            if (pool_addr == 0) {
+                size_t va_size = CUDA_POOL_VMM_MAX_SIZE;
+                CUresult res = CUDA_ERROR_OUT_OF_MEMORY;
+                while (va_size >= granularity) {
+                    res = cuMemAddressReserve(&pool_addr, va_size, 0, 0, 0);
+                    if (res == CUDA_SUCCESS) {
+                        break;
+                    }
+                    va_size /= 2;
+                }
+                CU_CHECK(res);
+                pool_va_size = va_size;
+                if (va_size < CUDA_POOL_VMM_MAX_SIZE) {
+                    GGML_LOG_INFO("%s: device %d reserved a %zu MiB VMM pool (%zu MiB unavailable)\n",
+                                  __func__, device, va_size / 1024 / 1024,
+                                  (size_t) CUDA_POOL_VMM_MAX_SIZE / 1024 / 1024);
+                }
+            }
+
+            GGML_ASSERT(pool_size + reserve_size <= pool_va_size);
 
             // allocate more physical memory
             CUmemAllocationProp prop = {};
@@ -581,11 +607,6 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
             CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
-
-            // reserve virtual address space (if not already reserved)
-            if (pool_addr == 0) {
-                CU_CHECK(cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0));
-            }
 
             // map at the end of the pool
             CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
