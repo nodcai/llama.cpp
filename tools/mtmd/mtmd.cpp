@@ -2311,7 +2311,9 @@ static bool mtmd_audio_stream_encode_all(mtmd_audio_stream * s, std::vector<floa
     batch.is_audio = true;
     batch.entries.push_back(std::move(mel_full));
 
-    std::vector<float> oneshot;  // sized by clip_image_batch_encode
+    // clip_image_batch_encode FILLS a pre-sized buffer; it does NOT resize.
+    // Passing an empty vector here silently produced zero embeddings.
+    std::vector<float> oneshot((size_t) n_tokens_total * (size_t) s->n_embd);
     if (!clip_image_batch_encode(s->ctx->ctx_a, s->ctx->n_threads, &batch, oneshot)) {
         LOG_ERR("%s: one-shot finalize encode failed (n_tokens=%d)\n",
                 __func__, n_tokens_total);
