@@ -6144,9 +6144,15 @@ bool clip_audio_stream_encode_chunk(struct clip_ctx * ctx,
         return false;
     }
 
-    // Read the soft-token chunk output (last node, shape [mm_embd, 12]).
-    ggml_tensor * out = ggml_graph_node(gf, -1);
+    // Read the soft-token chunk output, shape [mm_embd, 12]. Fetch BY NAME:
+    // build_streaming() expands the per-layer new_k/new_v/new_conv state
+    // tensors after the head, so ggml_graph_node(gf, -1) is the last new_conv
+    // (conv_inner * 4 floats) -- reading that wrote conv state into the token
+    // buffer and left the rest zero.
+    ggml_tensor * out = ggml_graph_get_tensor(gf, "stream_out");
+    GGML_ASSERT(out != nullptr && "streaming graph has no stream_out tensor");
     if (out_chunk != nullptr) {
+        GGML_ASSERT((size_t) ggml_nelements(out) == (size_t) 12 * (size_t) clip_n_mmproj_embd(ctx));
         ggml_backend_tensor_get(out, out_chunk, 0, ggml_nbytes(out));
     }
 

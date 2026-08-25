@@ -569,6 +569,11 @@ ggml_cgraph * clip_graph_gemma4a::build_streaming() {
 
     ggml_tensor * encoded = build_streaming_body(chunk);
     ggml_tensor * head    = build_head(encoded);
+    // Name + mark the soft-token output explicitly. The caller must NOT rely on
+    // it being the last graph node: the per-layer new_k/new_v/new_conv state
+    // tensors are expanded after it below, so node(-1) is the last new_conv.
+    ggml_set_name(head, "stream_out");
+    ggml_set_output(head);
     ggml_build_forward_expand(gf, head);
 
     // The per-layer K/V/conv state-update tensors aren't on the head's
