@@ -2393,6 +2393,23 @@ void mtmd_audio_stream_free(mtmd_audio_stream * s) {
     delete s;
 }
 
+mtmd_audio_stream * mtmd_audio_stream_clone(const mtmd_audio_stream * s) {
+    if (!s) {
+        return nullptr;
+    }
+    auto * c = new mtmd_audio_stream;
+    c->ctx                   = s->ctx;
+    c->n_embd                = s->n_embd;
+    c->n_emitted             = s->n_emitted;
+    c->finalized             = s->finalized;
+    c->preproc               = std::make_unique<mtmd_audio_stream_preproc_gemma4a>(*s->preproc);
+    c->enc_state             = s->enc_state;
+    c->enc_state_initialized = s->enc_state_initialized;
+    c->n_chunks_streamed     = s->n_chunks_streamed;
+    c->streamed_tokens       = s->streamed_tokens;
+    return c;
+}
+
 void mtmd_audio_stream_push_pcm(mtmd_audio_stream * s, const float * samples, size_t n_samples) {
     if (!s || s->finalized || !samples || n_samples == 0) {
         return;

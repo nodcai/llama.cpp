@@ -397,6 +397,9 @@ typedef struct mtmd_audio_stream mtmd_audio_stream;
 MTMD_API mtmd_audio_stream * mtmd_audio_stream_init(mtmd_context * ctx);
 MTMD_API void                mtmd_audio_stream_free(mtmd_audio_stream * stream);
 
+// Deep copy of a stream. For example, finalize the copy and keep pushing to the original.
+MTMD_API mtmd_audio_stream * mtmd_audio_stream_clone(const mtmd_audio_stream * stream);
+
 // Append PCM samples (16 kHz mono f32). May be called any number of times.
 MTMD_API void mtmd_audio_stream_push_pcm(mtmd_audio_stream * stream,
                                          const float * samples,
