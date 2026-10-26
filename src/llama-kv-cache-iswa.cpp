@@ -22,13 +22,14 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_ubatch,
+                 uint32_t   n_ctx_swa,
                  uint32_t   n_pad,
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share) :
     llama_kv_cache_iswa(model, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
-            kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share) {
+            kv_size, n_seq_max, n_ubatch, n_ctx_swa, n_pad, mem_other, filter, reuse, share) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -43,6 +44,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_ubatch,
+                 uint32_t   n_ctx_swa,
                  uint32_t   n_pad,
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
@@ -72,12 +74,22 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     //       https://github.com/ggml-org/llama.cpp/issues/17037
     uint32_t size_swa = GGML_PAD(std::min(size_base, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
 
+    // the caller can ask for more room, e.g. to keep cells that a rollback will need
+    if (n_ctx_swa > 0) {
+        size_swa = std::max(size_swa, GGML_PAD(std::min(size_base, n_ctx_swa), 256));
+    }
+
     // when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size
     if (swa_full) {
         LLAMA_LOG_WARN("%s: using full-size SWA cache (ref: %s)\n",
                 __func__, "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
 
         size_swa = size_base;
+    }
+
+    // cross-stream copies need the full range, see llama_kv_cache::seq_cp
+    if (unified && size_swa < size_base) {
+        n_swa_cp = hparams.n_swa;
     }
 
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
@@ -121,6 +133,15 @@ bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 
 void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     kv_base->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+
+    // the SWA layers of the destination never attend beyond the window at the end of the range
+    if (n_swa_cp > 0) {
+        if (p1 < 0) {
+            p1 = kv_swa->seq_pos_max(seq_id_src) + 1;
+        }
+        p0 = std::max(p0, p1 - (llama_pos) n_swa_cp);
+    }
+
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 

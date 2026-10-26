@@ -1219,6 +1219,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_ubatch,
+                 uint32_t   n_ctx_swa,
                  uint32_t   n_pad,
                  uint32_t   n_rs_seq,
     const layer_filter_cb & filter,
@@ -1255,7 +1256,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
             model, hparams_raw, type_k, type_v,
-            v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_pad,
+            v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_ctx_swa, n_pad,
             nullptr, filter_raw, reuse, nullptr);
 
     dsv4_make_k_only(hparams_csa);

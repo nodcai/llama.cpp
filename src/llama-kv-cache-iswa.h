@@ -24,6 +24,7 @@ public:
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch,
+                     uint32_t   n_ctx_swa,
                      uint32_t   n_pad,
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
@@ -42,6 +43,7 @@ public:
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch,
+                     uint32_t   n_ctx_swa,
                      uint32_t   n_pad,
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
@@ -92,6 +94,9 @@ public:
 
 private:
     const bool unified;
+
+    // the SWA cache keeps one window per sequence, so seq_cp copies at most this many positions (0 = all)
+    uint32_t n_swa_cp = 0;
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_swa;

@@ -390,6 +390,7 @@ llama_context::llama_context(
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
             /*.swa_full  =*/ params.swa_full,
+            /*.n_ctx_swa =*/ params.n_ctx_swa,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
@@ -3803,6 +3804,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.n_ctx_swa                   =*/ 0,
     };
 
     return result;

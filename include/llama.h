@@ -422,6 +422,10 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // SWA KV cache size in cells when swa_full is false, 0 = n_swa per sequence + n_ubatch
+        // that default is a minimum; without kv_unified the size applies to each sequence
+        uint32_t n_ctx_swa;
     };
 
     struct llama_model_tensor_override {
@@ -767,6 +771,7 @@ extern "C" {
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
+    // with a window-sized SWA cache (swa_full = false), the SWA layers receive only the last n_swa positions of the range
     LLAMA_API void llama_memory_seq_cp(
             llama_memory_t mem,
               llama_seq_id seq_id_src,
